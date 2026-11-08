@@ -110,3 +110,34 @@ class ChatMessage {
             const [],
       );
 }
+
+class ChatConversation {
+  const ChatConversation({
+    required this.id,
+    required this.title,
+    required this.updatedAt,
+    required this.messages,
+  });
+
+  final String id;
+  final String title;
+  final DateTime updatedAt;
+  final List<ChatMessage> messages;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'updatedAt': updatedAt.toIso8601String(),
+        'messages': messages.map((m) => m.toJson()).toList(),
+      };
+
+  factory ChatConversation.fromJson(Map<String, dynamic> json) => ChatConversation(
+        id: json['id'] as String? ?? DateTime.now().microsecondsSinceEpoch.toString(),
+        title: json['title'] as String? ?? 'New chat',
+        updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ?? DateTime.now(),
+        messages: (json['messages'] as List<dynamic>? ?? const [])
+            .whereType<Map>()
+            .map((e) => ChatMessage.fromJson(Map<String, dynamic>.from(e)))
+            .toList(growable: false),
+      );
+}

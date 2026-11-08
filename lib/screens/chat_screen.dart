@@ -1,16 +1,16 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter/services.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:mime/mime.dart';
 
 import '../models/chat_message.dart';
-import '../services/chat_api.dart';
 import '../services/settings_store.dart';
+import '../viewmodels/chat_view_model.dart';
 import 'settings_screen.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -28,39 +28,44 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final ChatApi _api = ChatApi();
+  late final ChatViewModel _vm;
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   final FocusNode _focus = FocusNode();
 
   late AppSettings _settings;
-  List<ChatMessage> _messages = const [];
-  List<ChatAttachment> _pendingAttachments = const [];
-  StreamSubscription<String>? _subscription;
-  bool _sending = false;
-  String? _error;
+  List<ChatMessage> get _messages => _vm.messages;
+  List<ChatConversation> get _conversations => _vm.conversations;
+  List<ChatAttachment> get _pendingAttachments => _vm.pendingAttachments;
+  bool get _sending => _vm.sending;
+  String? get _error => _vm.error;
 
   @override
   void initState() {
     super.initState();
     _settings = widget.initialSettings;
+    _vm = ChatViewModel(store: widget.store, settings: _settings)..addListener(_onViewModelChanged);
     _restoreHistory();
   }
 
   @override
   void dispose() {
-    _subscription?.cancel();
+    _vm.removeListener(_onViewModelChanged);
+    _vm.dispose();
     _input.dispose();
     _scroll.dispose();
     _focus.dispose();
     super.dispose();
   }
 
+  void _onViewModelChanged() {
+    if (!mounted) return;
+    setState(() => _settings = _vm.settings);
+  }
+
   Future<void> _restoreHistory() async {
     try {
-      final history = await widget.store.loadHistory();
-      if (!mounted) return;
-      setState(() => _messages = history);
+      await _vm.restore();
       _scrollToEnd(jump: true);
     } catch (_) {
       // Keep a usable empty chat if history can't be restored.
@@ -92,17 +97,10 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (updated == null || !mounted) return;
     setState(() => _settings = updated);
+    _vm.updateSettings(updated);
   }
 
-  Future<void> _switchProfile(ApiProfile profile) async {
-    final updated = await widget.store.saveActiveProfile(
-      activeProfileId: profile.id,
-      profiles: _settings.profiles,
-      hasApiKey: _settings.hasApiKey,
-    );
-    if (!mounted) return;
-    setState(() => _settings = updated);
-  }
+  Future<void> _switchProfile(ApiProfile profile) async => _vm.switchProfile(profile);
 
   Future<void> _pickAttachments() async {
     if (_sending) return;
@@ -165,7 +163,7 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
       if (next.isNotEmpty && mounted) {
-        setState(() => _pendingAttachments = [..._pendingAttachments, ...next]);
+        _vm.addAttachments(next);
       }
     } catch (e) {
       if (mounted) {
@@ -179,93 +177,20 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _send() async {
     if (_sending) return;
     final text = _input.text.trim();
-    final attachments = _pendingAttachments;
-    if (text.isEmpty && attachments.isEmpty) return;
+    if (text.isEmpty && _pendingAttachments.isEmpty) return;
 
     if (!_settings.isConfigured) {
       await _openSettings();
       return;
     }
 
-    final apiKey = await widget.store.readApiKey();
-    if (!mounted) return;
-    if (apiKey == null) {
-      setState(() => _settings = _settings.copyWith(hasApiKey: false));
-      await _openSettings();
-      return;
-    }
-
-    final userMessage = ChatMessage(
-      role: ChatRole.user,
-      text: text,
-      attachments: attachments,
-    );
-    final history = [..._messages, userMessage];
     _input.clear();
-    setState(() {
-      _error = null;
-      _sending = true;
-      _pendingAttachments = const [];
-      _messages = [
-        ...history,
-        const ChatMessage(role: ChatRole.assistant, text: ''),
-      ];
-    });
     _scrollToEnd();
-    await widget.store.saveHistory(history);
-
-    final buffer = StringBuffer();
-    _subscription = _api
-        .streamReply(
-          baseUrl: _settings.baseUrl,
-          apiKey: apiKey,
-          model: _settings.model,
-          messages: history,
-        )
-        .listen(
-      (chunk) {
-        buffer.write(chunk);
-        if (!mounted) return;
-        setState(() {
-          _messages = [
-            ..._messages.sublist(0, _messages.length - 1),
-            ChatMessage(role: ChatRole.assistant, text: buffer.toString()),
-          ];
-        });
-        _scrollToEnd();
-      },
-      onError: (Object error) {
-        _finish(
-          error: error is ChatApiException ? error.message : error.toString(),
-        );
-      },
-      onDone: _finish,
-    );
+    await _vm.send(text);
+    _scrollToEnd();
   }
 
-  void _finish({String? error}) {
-    _subscription = null;
-    if (!mounted) return;
-    final messages = [..._messages];
-    if (messages.isNotEmpty &&
-        messages.last.role == ChatRole.assistant &&
-        messages.last.text.trim().isEmpty) {
-      messages.removeLast();
-    }
-    setState(() {
-      _messages = messages;
-      _sending = false;
-      _error = error;
-    });
-    widget.store.saveHistory(messages);
-  }
-
-  Future<void> _stop() async {
-    final subscription = _subscription;
-    _subscription = null;
-    await subscription?.cancel();
-    _finish();
-  }
+  Future<void> _stop() async => _vm.stop();
 
   Future<void> _confirmNewChat() async {
     if (_messages.isEmpty && _pendingAttachments.isEmpty) return;
@@ -287,13 +212,8 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-    await widget.store.clearHistory();
+    await _vm.startNewChat();
     if (!mounted) return;
-    setState(() {
-      _messages = const [];
-      _pendingAttachments = const [];
-      _error = null;
-    });
   }
 
   @override
@@ -342,6 +262,11 @@ class _ChatScreenState extends State<ChatScreen> {
       drawer: _AppDrawer(
         settings: _settings,
         messages: _messages,
+        conversations: _conversations,
+        onOpenConversation: (conversation) {
+          _vm.openConversation(conversation);
+          _scrollToEnd(jump: true);
+        },
         onSwitch: _switchProfile,
         onNewChat: _confirmNewChat,
         onOpenSettings: () async {
@@ -361,7 +286,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 if (_error != null)
                   _ErrorBanner(
                     message: _error!,
-                    onDismiss: () => setState(() => _error = null),
+                    onDismiss: () => _vm.dismissError(),
                   ),
                 Expanded(
                   child: _messages.isEmpty
@@ -433,10 +358,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         onDeleted: _sending
                             ? null
                             : () => setState(() {
-                                  _pendingAttachments = [
-                                    ..._pendingAttachments.sublist(0, i),
-                                    ..._pendingAttachments.sublist(i + 1),
-                                  ];
+                                  _vm.removeAttachment(i);
                                 }),
                       ),
                   ],
@@ -495,6 +417,8 @@ class _AppDrawer extends StatelessWidget {
   const _AppDrawer({
     required this.settings,
     required this.messages,
+    required this.conversations,
+    required this.onOpenConversation,
     required this.onSwitch,
     required this.onNewChat,
     required this.onOpenSettings,
@@ -502,6 +426,8 @@ class _AppDrawer extends StatelessWidget {
 
   final AppSettings settings;
   final List<ChatMessage> messages;
+  final List<ChatConversation> conversations;
+  final ValueChanged<ChatConversation> onOpenConversation;
   final ValueChanged<ApiProfile> onSwitch;
   final VoidCallback onNewChat;
   final VoidCallback onOpenSettings;
@@ -553,6 +479,19 @@ class _AppDrawer extends StatelessWidget {
                 leading: const Icon(Icons.chat_bubble_outline_rounded),
               ),
             ),
+            const SizedBox(height: 14),
+            Text('Chat history', style: theme.textTheme.labelLarge),
+            const SizedBox(height: 6),
+            for (final conversation in conversations)
+              ListTile(
+                leading: const Icon(Icons.history_rounded),
+                title: Text(conversation.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text('${conversation.messages.length} messages'),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  onOpenConversation(conversation);
+                },
+              ),
             const SizedBox(height: 14),
             Text('Model profiles', style: theme.textTheme.labelLarge),
             const SizedBox(height: 6),
@@ -702,6 +641,8 @@ class _AssistantMarkdown extends StatelessWidget {
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.35)),
         ),
+        tableColumnWidth: const IntrinsicColumnWidth(),
+        tableScrollbarThumbVisibility: true,
         blockquoteDecoration: BoxDecoration(
           color: scheme.primaryContainer.withValues(alpha: 0.25),
           borderRadius: BorderRadius.circular(8),
@@ -710,8 +651,35 @@ class _AssistantMarkdown extends StatelessWidget {
           ),
         ),
       ),
+      builders: {'pre': _CopyableCodeBlockBuilder(codeBg: codeBg, foreground: isDark ? const Color(0xFFE6E6E6) : const Color(0xFF1A1A1A), border: scheme.outlineVariant.withValues(alpha: 0.35))},
       extensionSet: md.ExtensionSet.gitHubFlavored,
     );
+  }
+}
+
+class _CopyableCodeBlockBuilder extends MarkdownElementBuilder {
+  _CopyableCodeBlockBuilder({required this.codeBg, required this.foreground, required this.border});
+  final Color codeBg;
+  final Color foreground;
+  final Color border;
+
+  @override
+  Widget? visitText(md.Text text, TextStyle? preferredStyle) {
+    final code = text.text;
+    return Builder(builder: (context) => Container(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      decoration: BoxDecoration(color: codeBg, borderRadius: BorderRadius.circular(12), border: Border.all(color: border)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Align(alignment: Alignment.centerRight, child: TextButton.icon(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: code));
+            if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Code copied')));
+          },
+          icon: const Icon(Icons.copy_rounded, size: 16), label: const Text('Copy'),
+        )),
+        SingleChildScrollView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.fromLTRB(12, 0, 12, 12), child: SelectableText(code, style: TextStyle(fontFamily: 'monospace', fontSize: 13, color: foreground))),
+      ]),
+    ));
   }
 }
 

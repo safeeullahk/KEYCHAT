@@ -101,6 +101,7 @@ class SettingsStore {
   static const String _profilesKey = 'profiles_v1';
   static const String _activeProfileKey = 'active_profile_id';
   static const String _historyKey = 'chat_history_v1';
+  static const String _conversationsKey = 'conversations_v1';
   static const String _apiKeyKey = 'api_key';
 
   final FlutterSecureStorage _secure = const FlutterSecureStorage();
@@ -253,5 +254,28 @@ class SettingsStore {
   Future<void> clearHistory() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_historyKey);
+  }
+
+  Future<List<ChatConversation>> loadConversations() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_conversationsKey);
+    if (raw != null) {
+      try {
+        return (jsonDecode(raw) as List)
+            .whereType<Map>()
+            .map((e) => ChatConversation.fromJson(Map<String, dynamic>.from(e)))
+            .toList(growable: true);
+      } catch (_) {}
+    }
+    final legacy = await loadHistory();
+    if (legacy.isEmpty) return [];
+    final old = ChatConversation(id: DateTime.now().microsecondsSinceEpoch.toString(), title: 'Previous chat', updatedAt: DateTime.now(), messages: legacy);
+    await saveConversations([old]);
+    return [old];
+  }
+
+  Future<void> saveConversations(List<ChatConversation> conversations) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_conversationsKey, jsonEncode(conversations.map((c) => c.toJson()).toList()));
   }
 }
